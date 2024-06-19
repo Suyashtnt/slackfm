@@ -5,7 +5,7 @@ use futures::Stream;
 use nestify::nest;
 use url::Url;
 
-pub const API_BASE: &str = "http://ws.audioscrobbler.com/2.0/";
+pub const API_BASE: &str = "https://ws.audioscrobbler.com/2.0/";
 
 pub struct Client {
     key: String,
@@ -55,7 +55,7 @@ impl Client {
     //
     // # Returns
     // returns a new track if a user is playing something new, else returns None if the user has stopped playing anything
-    pub async fn stream_now_playing<'a>(
+    pub fn stream_now_playing<'a>(
         &'a self,
         user: &'a str,
         polling_interval: Duration,
@@ -63,6 +63,9 @@ impl Client {
         let mut last_played_track: Option<RecentTrack> = None;
         try_stream! {
             loop {
+                // wait before the next poll
+                tokio::time::sleep(polling_interval).await;
+
                 let tracks = self.get_user_recent_tracks(user).await?;
                 let now_playing = tracks
                     .into_iter()
@@ -99,8 +102,6 @@ impl Client {
                     }
                 }
 
-                // wait for the next poll
-                tokio::time::sleep(polling_interval).await;
                 continue;
             }
         }
@@ -142,7 +143,7 @@ nest! {
                 #[serde(rename = "@attr")]
                 attr: Option<struct TrackAttributes {
                     #[serde(rename = "nowplaying")]
-                    now_playing: Option<bool>,
+                    now_playing: Option<String>,
                 }>,
             }>,
         },
@@ -160,6 +161,32 @@ pub struct RecentTrack {
     is_now_playing: bool,
 }
 
+impl RecentTrack {
+    pub fn mbid(&self) -> &str {
+        &self.mbid
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn artist(&self) -> &str {
+        &self.artist
+    }
+
+    pub fn album(&self) -> &str {
+        &self.album
+    }
+
+    pub fn image_url(&self) -> &Url {
+        &self.image_url
+    }
+
+    pub fn is_now_playing(&self) -> bool {
+        self.is_now_playing
+    }
+}
+
 impl From<Track> for RecentTrack {
     fn from(track: Track) -> Self {
         let image_url = track
@@ -175,9 +202,9 @@ impl From<Track> for RecentTrack {
             artist: track.artist.text,
             album: track.album.text,
             image_url,
-            is_now_playing: track
-                .attr
-                .map_or(false, |attr| attr.now_playing.unwrap_or(false)),
+            is_now_playing: track.attr.map_or(false, |attr| {
+                attr.now_playing.unwrap_or_else(|| "false".to_string()) == "true"
+            }),
         }
     }
 }
