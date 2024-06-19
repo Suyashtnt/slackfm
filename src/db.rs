@@ -127,4 +127,13 @@ impl Db {
         self.db.insert(username, Arc::new(Mutex::new(data)));
         self.to_encrypted_file().unwrap()
     }
+
+    pub fn user_with_csrf(&self, state: &String) -> Option<Arc<Mutex<UserData>>> {
+        self.db
+            .iter()
+            .find(|(_, user)| {
+                user.lock().unwrap().csrf_token().map(CsrfToken::secret) == Some(state)
+            })
+            .map(|(_, user)| user.clone())
+    }
 }

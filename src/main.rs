@@ -1,11 +1,11 @@
 mod db;
 
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Extension;
 use db::{Db, UserData};
 use dotenvy::dotenv;
@@ -13,11 +13,15 @@ use futures::{pin_mut, StreamExt};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::Response;
-use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl};
+use oauth2::reqwest::async_http_client;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, RedirectUrl, TokenUrl,
+};
+use serde::{Deserialize, Serialize};
 use slack_morphism::prelude::*;
 use slackfm::{lastfm, slack};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 mod env {
     use menv::require_envs;
@@ -39,9 +43,6 @@ mod env {
 
         slack_signing_secret, "SLACK_SIGNING_SECRET", String,
         "Please set your slack signing secret in the environment variable SLACK_SIGNING_SECRET";
-
-        slack_redirect_host, "SLACK_REDIRECT_HOST", String,
-        "Please set your slack redirect host URI in the environment variable SLACK_REDIRECT_HOST";
     }
 }
 
@@ -67,14 +68,6 @@ fn error_handler(
     eprintln!("{:#?}", err);
 
     HttpStatusCode::BAD_REQUEST
-}
-
-async fn test_oauth_install_function(
-    resp: SlackOAuthV2AccessTokenResponse,
-    _client: Arc<SlackHyperClient>,
-    _states: SlackClientEventsUserState,
-) {
-    println!("{:#?}", resp);
 }
 
 async fn test_welcome_installed() -> String {
@@ -129,7 +122,7 @@ async fn command_event(
                 ));
             };
 
-            let mut db = state.db.lock().unwrap();
+            let mut db = state.db.lock().await;
 
             let user = db.user(&event.user_id.0);
 
@@ -137,28 +130,21 @@ async fn command_event(
                 let mut user = user.lock().unwrap();
                 // update their last.fm username
                 user.update_lastfm_username(lastfm_username);
+                drop(user);
+                db.to_encrypted_file().unwrap();
 
                 axum::Json(SlackCommandEventResponse::new(
                     SlackMessageContent::new().with_text("Updated Last.fm username".into()),
                 ))
             } else {
-                let oauth_client = BasicClient::new(
-                    ClientId::new(env::slack_client_id()),
-                    Some(ClientSecret::new(env::slack_client_secret())),
-                    AuthUrl::new("https://slack.com/openid/connect/authorize".to_owned()).unwrap(),
-                    Some(
-                        TokenUrl::new("https://slack.com/openid.connect.token".to_owned()).unwrap(),
-                    ),
-                )
-                .set_redirect_uri(
-                    RedirectUrl::new("https://slackfm.wobbl.in/auth".to_owned()).unwrap(),
-                );
+                let oauth_client = create_oauth_client();
 
                 // note: we aren't doing PKCE since this is only ran on a trusted server
 
                 let (auth_url, csrf_token) = oauth_client
                     .authorize_url(CsrfToken::new_random)
-                    .add_extra_param("scope", "openid users.profile:write")
+                    .add_extra_param("scope", "")
+                    .add_extra_param("user_scope", "users.profile:read,users.profile:write")
                     .url();
 
                 db.add_user(event.user_id.0, UserData::new(lastfm_username, csrf_token));
@@ -182,11 +168,75 @@ async fn command_event(
     }
 }
 
-async fn test_interaction_event(
-    Extension(_environment): Extension<Arc<SlackHyperListenerEnvironment>>,
-    Extension(event): Extension<SlackInteractionEvent>,
-) {
-    println!("Received interaction event: {:?}", event);
+#[derive(Serialize, Deserialize, Debug)]
+struct SlackTokenFields {
+    pub authed_user: SlackAuthedUser,
+}
+impl oauth2::ExtraTokenFields for SlackTokenFields {}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SlackAuthedUser {
+    pub id: String,
+    pub scope: String,
+    pub access_token: String,
+    pub token_type: String,
+}
+
+pub type SlackOauthClient = oauth2::Client<
+    oauth2::StandardErrorResponse<oauth2::basic::BasicErrorResponseType>,
+    oauth2::StandardTokenResponse<SlackTokenFields, oauth2::basic::BasicTokenType>,
+    oauth2::basic::BasicTokenType,
+    oauth2::basic::BasicTokenIntrospectionResponse,
+    oauth2::StandardRevocableToken,
+    oauth2::basic::BasicRevocationErrorResponse,
+>;
+
+fn create_oauth_client() -> SlackOauthClient {
+    SlackOauthClient::new(
+        ClientId::new(env::slack_client_id()),
+        Some(ClientSecret::new(env::slack_client_secret())),
+        AuthUrl::new("https://slack.com/oauth/v2/authorize".to_owned()).unwrap(),
+        Some(TokenUrl::new("https://slack.com/oauth.v2.access".to_owned()).unwrap()),
+    )
+    .set_redirect_uri(
+        RedirectUrl::new("https://slackfm.wobbl.in/auth/callback".to_owned()).unwrap(),
+    )
+}
+
+#[derive(Deserialize)]
+struct OauthCode {
+    code: String,
+    state: String,
+}
+
+async fn oauth_handler(
+    Query(code): Query<OauthCode>,
+    State(state): State<AppState>,
+) -> &'static str {
+    let db = state.db.lock().await;
+    // Retrieve the csrf token and pkce verifier
+    let Some(user) = db.user_with_csrf(&code.state) else {
+        return "CSRF couldn't be linked to a user. Theres a middleman at play or I didn't save properly";
+    };
+
+    let client = create_oauth_client();
+
+    let response = client
+        .exchange_code(AuthorizationCode::new(code.code))
+        .request_async(async_http_client)
+        .await
+        .unwrap();
+
+    let user_token = response.extra_fields().authed_user.access_token.clone();
+
+    let mut user = user.lock().unwrap();
+    user.promote_token(user_token);
+
+    drop(user);
+
+    db.to_encrypted_file().unwrap();
+
+    "Authenticated!"
 }
 
 #[derive(Clone)]
@@ -217,12 +267,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
-    let oauth_config = SlackOAuthListenerConfig::new(
-        env::slack_client_id().into(),
-        env::slack_client_secret().into(),
-        "commands".to_string(),
-        env::slack_redirect_host(),
-    );
 
     let listener_environment = Arc::new(
         SlackClientEventsListenerEnvironment::new(client.clone()).with_error_handler(error_handler),
@@ -243,10 +287,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ),
         )
         .with_state(app_state.clone())
-        .nest(
-            "/auth",
-            listener.oauth_router("/auth", &oauth_config, test_oauth_install_function),
-        )
+        .route("/auth", axum::routing::get(oauth_handler))
+        .with_state(app_state.clone())
         .route("/installed", axum::routing::get(test_welcome_installed))
         .route("/cancelled", axum::routing::get(test_cancelled_install))
         .route("/error", axum::routing::get(test_error_install))
@@ -257,17 +299,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     .events_layer(&signing_secret)
                     .with_event_extractor(SlackEventsExtractors::push_event()),
             ),
-        )
-        .route(
-            "/interaction",
-            axum::routing::post(test_interaction_event).layer(
-                listener
-                    .events_layer(&signing_secret)
-                    .with_event_extractor(SlackEventsExtractors::interaction_event()),
-            ),
         );
 
-    spawn_client_update_loop(client.clone(), app_state.clone());
+    spawn_client_update_loop(client.clone(), app_state.clone()).await;
 
     axum::serve(TcpListener::bind(&addr).await.unwrap(), app)
         .await
@@ -276,11 +310,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn spawn_client_update_loop(
+async fn spawn_client_update_loop(
     client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
     state: AppState,
 ) {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock().await;
 
     for (slack_user_id, user_data) in db.users() {
         let user_id = SlackUserId::new(slack_user_id.into());
@@ -298,7 +332,7 @@ async fn update_user_data(
     client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
     lastfm_client: Arc<lastfm::Client>,
     user_id: SlackUserId,
-    user_data: Arc<Mutex<UserData>>,
+    user_data: Arc<std::sync::Mutex<UserData>>,
 ) {
     let (lastfm_username, slack_token) = {
         let user_data = user_data.lock().unwrap();
