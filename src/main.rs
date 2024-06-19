@@ -2,17 +2,21 @@ mod db;
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::Extension;
-use db::Db;
+use db::{Db, UserData};
 use dotenvy::dotenv;
+use futures::{pin_mut, StreamExt};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::Response;
+use oauth2::basic::BasicClient;
+use oauth2::{AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl};
 use slack_morphism::prelude::*;
-use slackfm::lastfm;
+use slackfm::{lastfm, slack};
 use tokio::net::TcpListener;
 
 mod env {
@@ -108,32 +112,65 @@ async fn command_event(
         "/connect" => {
             println!("Received connect command");
 
-            let Some(username) = event
-                .text
-                .and_then(|text| text.split_once(" ").map(|split| split.0.to_owned()))
-            else {
+            let Some(lastfm_username) = event.text.and_then(|text| {
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(
+                        text.split_once(" ")
+                            .map(|split| split.0.to_owned())
+                            .unwrap_or_else(|| text.to_owned()),
+                    )
+                }
+            }) else {
                 return axum::Json(SlackCommandEventResponse::new(
                     SlackMessageContent::new()
                         .with_text("No username found. Please give one".into()),
                 ));
             };
 
-            let db = state.db.lock().unwrap();
+            let mut db = state.db.lock().unwrap();
 
             let user = db.user(&event.user_id.0);
 
-            if let Some(user) = user {
+            if let Some(user) = user.filter(|user| user.lock().unwrap().slack_token().is_some()) {
                 let mut user = user.lock().unwrap();
                 // update their last.fm username
-                user.update_lastfm_username(username);
+                user.update_lastfm_username(lastfm_username);
 
                 axum::Json(SlackCommandEventResponse::new(
                     SlackMessageContent::new().with_text("Updated Last.fm username".into()),
                 ))
             } else {
-                axum::Json(SlackCommandEventResponse::new(
-                    SlackMessageContent::new().with_text("Working on it".into()),
-                ))
+                let oauth_client = BasicClient::new(
+                    ClientId::new(env::slack_client_id()),
+                    Some(ClientSecret::new(env::slack_client_secret())),
+                    AuthUrl::new("https://slack.com/openid/connect/authorize".to_owned()).unwrap(),
+                    Some(
+                        TokenUrl::new("https://slack.com/openid.connect.token".to_owned()).unwrap(),
+                    ),
+                )
+                .set_redirect_uri(
+                    RedirectUrl::new("https://slackfm.wobbl.in/auth".to_owned()).unwrap(),
+                );
+
+                // note: we aren't doing PKCE since this is only ran on a trusted server
+
+                let (auth_url, csrf_token) = oauth_client
+                    .authorize_url(CsrfToken::new_random)
+                    .add_extra_param("scope", "openid users.profile:write")
+                    .url();
+
+                db.add_user(event.user_id.0, UserData::new(lastfm_username, csrf_token));
+
+                // send an oauth link
+                axum::Json(
+                    SlackCommandEventResponse::new(SlackMessageContent::new().with_text(format!(
+                        "Please visit {} to allow SlackFM to access and modify your profile/status",
+                        auth_url
+                    )))
+                    .with_response_type(SlackMessageResponseType::Ephemeral),
+                )
             }
         }
         _ => {
@@ -162,11 +199,17 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
 
     // TODO: figure out if the signing secret is actually useful as an encryption key
-    let db = Db::from_encrypted_file(&cwd.join("db.json.enc"), &env::slack_signing_secret())
-        .unwrap_or_else(Db::new);
+    let db = Db::from_encrypted_file(cwd.join("db.json.enc"), env::slack_signing_secret())?;
 
     let app_state = AppState {
         db: Arc::new(Mutex::new(db)),
+        lastfm_client: Arc::new(lastfm::Client::new(
+            env::lastfm_key(),
+            reqwest::Client::builder()
+                .user_agent("slackfm-bot")
+                .build()
+                .unwrap(),
+        )),
     };
 
     let client = Arc::new(SlackClient::new(
@@ -233,7 +276,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn spawn_client_update_loop(
+fn spawn_client_update_loop(
     client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
     state: AppState,
 ) {
@@ -242,6 +285,56 @@ async fn spawn_client_update_loop(
     for (slack_user_id, user_data) in db.users() {
         let user_id = SlackUserId::new(slack_user_id.into());
         let lastfm_client = state.lastfm_client.clone();
-        tokio::task::spawn(async move { todo!() });
+        tokio::task::spawn(update_user_data(
+            client.clone(),
+            lastfm_client,
+            user_id,
+            user_data,
+        ));
+    }
+}
+
+async fn update_user_data(
+    client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
+    lastfm_client: Arc<lastfm::Client>,
+    user_id: SlackUserId,
+    user_data: Arc<Mutex<UserData>>,
+) {
+    let (lastfm_username, slack_token) = {
+        let user_data = user_data.lock().unwrap();
+        let lastfm = user_data.lastfm_username().to_owned();
+        let slack = user_data.slack_token().map(ToOwned::to_owned);
+        (lastfm, slack)
+    };
+
+    let Some(slack_token) = slack_token else {
+        println!(
+            "No slack token for user {}. User didn't authenticate it seems",
+            user_id
+        );
+        return;
+    };
+
+    let slack_client = slack::Client::from_client(client, slack_token, env::slack_team_id());
+
+    let stream = lastfm_client.stream_now_playing(&lastfm_username, Duration::from_secs(10));
+
+    pin_mut!(stream);
+
+    while let Some(track) = stream.next().await {
+        match track {
+            Ok(track) => {
+                if let Some(track) = track {
+                    println!("updating status for {} to {}", user_id, track.name());
+                    println!("TODO: update slack status");
+                } else {
+                    println!("updating status for {} to not listening/blank", user_id);
+                    println!("TODO: update slack status");
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
+        }
     }
 }

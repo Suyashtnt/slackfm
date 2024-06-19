@@ -1,22 +1,30 @@
 use age::secrecy::Secret;
+use oauth2::CsrfToken;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 #[derive(Serialize, Deserialize)]
 pub struct UserData {
     lastfm_username: String,
-    slack_token: String,
+    slack_token: SlackToken,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum SlackToken {
+    Oauth(String),
+    // we might be waiting for the user to authorize the app
+    Csrf(CsrfToken),
 }
 
 impl UserData {
-    pub fn new(lastfm_username: String, slack_token: String) -> Self {
+    pub fn new(lastfm_username: String, csrf: CsrfToken) -> Self {
         UserData {
             lastfm_username,
-            slack_token,
+            slack_token: SlackToken::Csrf(csrf),
         }
     }
 
@@ -24,70 +32,99 @@ impl UserData {
         self.lastfm_username = lastfm_username;
     }
 
-    pub fn slack_token(&self) -> &str {
-        &self.slack_token
+    pub fn slack_token(&self) -> Option<&str> {
+        match &self.slack_token {
+            SlackToken::Oauth(token) => Some(token),
+            _ => None,
+        }
+    }
+
+    pub fn csrf_token(&self) -> Option<&CsrfToken> {
+        match &self.slack_token {
+            SlackToken::Csrf(token) => Some(token),
+            _ => None,
+        }
     }
 
     pub fn lastfm_username(&self) -> &str {
         &self.lastfm_username
     }
+
+    pub fn promote_token(&mut self, token: String) {
+        self.slack_token = SlackToken::Oauth(token);
+    }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Db(HashMap<String, Arc<Mutex<UserData>>>);
+pub struct Db {
+    db: HashMap<String, Arc<Mutex<UserData>>>,
+    location: PathBuf,
+    key: String,
+}
 
 impl Db {
-    pub fn new() -> Self {
-        Db(HashMap::new())
+    pub fn new(file_path: PathBuf, key: String) -> Self {
+        Db {
+            db: HashMap::new(),
+            location: file_path,
+            key,
+        }
     }
 
     /// Create a new Db instance from an encrypted file
-    pub fn from_encrypted_file(file_path: &Path, key: &str) -> Option<Self> {
+    pub fn from_encrypted_file(
+        file_path: PathBuf,
+        key: String,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if !file_path.exists() {
-            return None;
+            return Ok(Self::new(file_path, key));
         }
 
-        let file_reader = std::fs::File::open(file_path).ok()?;
+        let file_reader = std::fs::File::open(&file_path)?;
 
-        let decrypted: Db = {
-            let decryptor = match age::Decryptor::new(&file_reader).ok()? {
+        let db: HashMap<String, Arc<Mutex<UserData>>> = {
+            let decryptor = match age::Decryptor::new(&file_reader)? {
                 age::Decryptor::Passphrase(d) => d,
                 _ => unreachable!(),
             };
 
-            let mut reader = decryptor.decrypt(&Secret::new(key.to_owned()), None).ok()?;
-            serde_json::from_reader(&mut reader).ok()?
+            let mut reader = decryptor.decrypt(&Secret::new(key.to_owned()), None)?;
+            serde_json::from_reader(&mut reader)?
         };
 
-        Some(decrypted)
+        Ok(Self {
+            db,
+            location: file_path,
+            key,
+        })
     }
 
-    pub fn to_encrypted_file(
-        &self,
-        file_path: &Path,
-        key: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn to_encrypted_file(&self) -> Result<(), Box<dyn std::error::Error>> {
         let encrypted = {
-            let encryptor = age::Encryptor::with_user_passphrase(Secret::new(key.to_owned()));
+            let encryptor = age::Encryptor::with_user_passphrase(Secret::new(self.key.clone()));
 
             let mut encrypted = vec![];
             let mut writer = encryptor.wrap_output(&mut encrypted)?;
-            serde_json::to_writer(&mut writer, self)?;
+            serde_json::to_writer(&mut writer, &self.db)?;
             writer.finish()?;
 
             encrypted
         };
 
-        std::fs::write(file_path, encrypted)?;
+        std::fs::write(&self.location, encrypted)?;
 
         Ok(())
     }
 
     pub fn user(&self, username: &str) -> Option<Arc<Mutex<UserData>>> {
-        self.0.get(username).cloned()
+        self.db.get(username).cloned()
     }
 
     pub fn users(&self) -> impl Iterator<Item = (&String, Arc<Mutex<UserData>>)> {
-        self.0.iter().map(|(k, v)| (k, v.clone()))
+        self.db.iter().map(|(k, v)| (k, v.clone()))
+    }
+
+    pub fn add_user(&mut self, username: String, data: UserData) {
+        self.db.insert(username, Arc::new(Mutex::new(data)));
+        self.to_encrypted_file().unwrap()
     }
 }

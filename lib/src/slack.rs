@@ -1,15 +1,15 @@
-use std::io;
+use std::{io, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use errors::SlackClientError;
 use slack_morphism::prelude::*;
 
-pub struct Slack {
-    client: SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>,
+pub struct Client {
+    client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
     token: SlackApiToken,
 }
 
-impl Slack {
+impl Client {
     pub fn new(
         token: impl Into<SlackApiTokenValue>,
         team_id: impl Into<SlackTeamId>,
@@ -19,17 +19,20 @@ impl Slack {
         );
         let token: SlackApiToken = SlackApiToken::new(token.into()).with_team_id(team_id.into());
 
-        Ok(Self { client, token })
+        Ok(Self {
+            client: client.into(),
+            token,
+        })
     }
 
     pub fn from_client(
-        client: SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>,
-        token: impl Into<SlackApiToken>,
+        client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
+        token: impl Into<SlackApiTokenValue>,
         team_id: impl Into<SlackTeamId>,
     ) -> Self {
         Self {
             client,
-            token: token.into().with_team_id(team_id.into()),
+            token: SlackApiToken::new(token.into()).with_team_id(team_id.into()),
         }
     }
 
