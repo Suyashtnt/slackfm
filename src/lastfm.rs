@@ -171,6 +171,7 @@ impl From<Track> for RecentTrack {
 
         Self {
             name: track.name,
+            mbid: track.mbid,
             artist: track.artist.text,
             album: track.album.text,
             image_url,
