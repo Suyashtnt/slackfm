@@ -143,7 +143,7 @@ async fn command_event(
 
                 let (auth_url, csrf_token) = oauth_client
                     .authorize_url(CsrfToken::new_random)
-                    .add_extra_param("scope", "")
+                    .add_extra_param("scope", "commands")
                     .add_extra_param("user_scope", "users.profile:read,users.profile:write")
                     .url();
 
@@ -196,11 +196,9 @@ fn create_oauth_client() -> SlackOauthClient {
         ClientId::new(env::slack_client_id()),
         Some(ClientSecret::new(env::slack_client_secret())),
         AuthUrl::new("https://slack.com/oauth/v2/authorize".to_owned()).unwrap(),
-        Some(TokenUrl::new("https://slack.com/oauth.v2.access".to_owned()).unwrap()),
+        Some(TokenUrl::new("https://slack.com/api/oauth.v2.access".to_owned()).unwrap()),
     )
-    .set_redirect_uri(
-        RedirectUrl::new("https://slackfm.wobbl.in/auth/callback".to_owned()).unwrap(),
-    )
+    .set_redirect_uri(RedirectUrl::new("https://slackfm.wobbl.in/auth".to_owned()).unwrap())
 }
 
 #[derive(Deserialize)]
@@ -215,7 +213,7 @@ async fn oauth_handler(
 ) -> &'static str {
     let db = state.db.lock().await;
     // Retrieve the csrf token and pkce verifier
-    let Some(user) = db.user_with_csrf(&code.state) else {
+    let Some(user_arc) = db.user_with_csrf(&code.state) else {
         return "CSRF couldn't be linked to a user. Theres a middleman at play or I didn't save properly";
     };
 
@@ -228,13 +226,20 @@ async fn oauth_handler(
         .unwrap();
 
     let user_token = response.extra_fields().authed_user.access_token.clone();
+    let user_id = response.extra_fields().authed_user.id.clone();
 
-    let mut user = user.lock().unwrap();
+    let mut user = user_arc.lock().unwrap();
     user.promote_token(user_token);
 
     drop(user);
 
     db.to_encrypted_file().unwrap();
+    tokio::task::spawn(update_user_data(
+        state.slack_client.clone(),
+        state.lastfm_client.clone(),
+        user_id.into(),
+        user_arc,
+    ));
 
     "Authenticated!"
 }
@@ -243,6 +248,7 @@ async fn oauth_handler(
 struct AppState {
     db: Arc<Mutex<Db>>,
     lastfm_client: Arc<lastfm::Client>,
+    slack_client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
 }
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
@@ -260,16 +266,16 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .build()
                 .unwrap(),
         )),
+        slack_client: Arc::new(SlackClient::new(
+            SlackClientHyperConnector::new()?.with_rate_control(SlackApiRateControlConfig::new()),
+        )),
     };
-
-    let client = Arc::new(SlackClient::new(
-        SlackClientHyperConnector::new()?.with_rate_control(SlackApiRateControlConfig::new()),
-    ));
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
 
     let listener_environment = Arc::new(
-        SlackClientEventsListenerEnvironment::new(client.clone()).with_error_handler(error_handler),
+        SlackClientEventsListenerEnvironment::new(app_state.slack_client.clone())
+            .with_error_handler(error_handler),
     );
     let signing_secret: SlackSigningSecret = env::slack_signing_secret().into();
 
@@ -301,7 +307,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
 
-    spawn_client_update_loop(client.clone(), app_state.clone()).await;
+    spawn_client_update_loop(app_state.clone()).await;
 
     axum::serve(TcpListener::bind(&addr).await.unwrap(), app)
         .await
@@ -310,17 +316,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn spawn_client_update_loop(
-    client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
-    state: AppState,
-) {
+async fn spawn_client_update_loop(state: AppState) {
     let db = state.db.lock().await;
 
     for (slack_user_id, user_data) in db.users() {
         let user_id = SlackUserId::new(slack_user_id.into());
         let lastfm_client = state.lastfm_client.clone();
         tokio::task::spawn(update_user_data(
-            client.clone(),
+            state.slack_client.clone(),
             lastfm_client,
             user_id,
             user_data,
