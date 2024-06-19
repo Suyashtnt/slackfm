@@ -10,7 +10,7 @@ pub struct Slack {
 }
 
 impl Slack {
-    fn new(
+    pub fn new(
         token: impl Into<SlackApiTokenValue>,
         team_id: impl Into<SlackTeamId>,
     ) -> io::Result<Self> {
@@ -20,6 +20,21 @@ impl Slack {
         let token: SlackApiToken = SlackApiToken::new(token.into()).with_team_id(team_id.into());
 
         Ok(Self { client, token })
+    }
+
+    pub fn from_client(
+        client: SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>,
+        token: impl Into<SlackApiToken>,
+        team_id: impl Into<SlackTeamId>,
+    ) -> Self {
+        Self {
+            client,
+            token: token.into().with_team_id(team_id.into()),
+        }
+    }
+
+    pub fn client(&self) -> &SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>> {
+        &self.client
     }
 
     pub async fn update_user_status(
