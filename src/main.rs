@@ -184,7 +184,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         )),
     };
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 5127));
 
     let listener_environment = Arc::new(
         SlackClientEventsListenerEnvironment::new(app_state.slack_client.clone())
