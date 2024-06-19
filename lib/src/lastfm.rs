@@ -60,7 +60,7 @@ impl Client {
         user: &'a str,
         polling_interval: Duration,
     ) -> impl Stream<Item = Result<Option<RecentTrack>, reqwest::Error>> + 'a {
-        let mut last_played_track: Option<RecentTrack> = None;
+        let mut last_playing: Option<RecentTrack> = None;
         try_stream! {
             loop {
                 // wait before the next poll
@@ -71,35 +71,32 @@ impl Client {
                     .into_iter()
                     .find(|track| track.is_now_playing);
 
-                // return early if the user isn't playing anything now
-                let Some(now_playing) = now_playing else {
-                    if last_played_track != None {
-                        last_played_track = None;
+                match (now_playing, last_playing.clone()) {
+                    // the user is not playing anything nor has played anything before
+                    (None, None) => continue,
+                    // The user has started to play their first song
+                    (Some(playing), None) => {
+                        last_playing = Some(playing.clone());
+                        yield Some(playing);
+                    },
+                    // The user has stopped playing anything
+                    (None, Some(_)) => {
+                        last_playing = None;
                         yield None;
-                    }
-                    continue;
-                };
-
-                let Some(ref last_playing) = last_played_track else {
-                    // if we weren't playing anything before, then we're playing something new
-                    last_played_track = Some(now_playing.clone());
-                    yield Some(now_playing);
-                    continue;
-                };
-
-                // else, check if the user is playing a new track through checking the mbid and name
-
-                // make sure the mbid is not empty before checking if they're different
-                if now_playing.mbid != "" {
-                    if now_playing.mbid != last_playing.mbid {
-                        last_played_track = Some(now_playing.clone());
-                        yield Some(now_playing);
-                    }
-                } else {
-                   if now_playing.name != last_playing.name {
-                        last_played_track = Some(now_playing.clone());
-                        yield Some(now_playing);
-                    }
+                    },
+                    // The user is playing a new track
+                    (Some(playing), Some(last)) => {
+                        // make sure the mbid is not empty before checking if they're different
+                        if playing.mbid != "" {
+                            if playing.mbid != last.mbid {
+                                last_playing = Some(playing.clone());
+                                yield Some(playing);
+                            }
+                        } else if playing.name != last.name {
+                            last_playing = Some(playing.clone());
+                            yield Some(playing);
+                        }
+                    },
                 }
 
                 continue;
