@@ -9,7 +9,7 @@ use axum::extract::{Query, State};
 use axum::Extension;
 use db::{Db, UserData};
 use dotenvy::dotenv;
-use futures::{pin_mut, StreamExt};
+use futures::{pin_mut, stream, StreamExt};
 use oauth::{create_oauth_client, OauthCode};
 use oauth2::reqwest::async_http_client;
 use oauth2::{AuthorizationCode, CsrfToken};
@@ -67,6 +67,18 @@ async fn command_event(
                         .with_text("No username found. Please give one".into()),
                 ));
             };
+
+            // check if the lastfm user exists
+            if !state
+                .lastfm_client
+                .does_user_exist(&lastfm_username)
+                .await
+                .unwrap_or(false)
+            {
+                return axum::Json(SlackCommandEventResponse::new(
+                    SlackMessageContent::new().with_text("The lastfm username isn't valid/doesn't exist. Make sure you're inputting your username from the URL (https://www.last.fm/user/<username>)".into()),
+                ));
+            }
 
             let mut db = state.db.lock().await;
 
@@ -172,7 +184,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         )),
     };
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
 
     let listener_environment = Arc::new(
         SlackClientEventsListenerEnvironment::new(app_state.slack_client.clone())
@@ -207,7 +219,23 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn spawn_initial_updaters(state: AppState) {
-    let db = state.db.lock().await;
+    let mut db = state.db.lock().await;
+
+    db.map_db(|hashmap| {
+        stream::iter(hashmap.into_iter())
+            .filter(|(_, user_data)| {
+                let lastfm_client = state.lastfm_client.clone();
+                let lastfm_username = user_data.lock().unwrap().lastfm_username().to_owned();
+                async move {
+                    lastfm_client
+                        .does_user_exist(&lastfm_username)
+                        .await
+                        .unwrap_or(false)
+                }
+            })
+            .collect()
+    })
+    .await;
 
     for (slack_user_id, user_data) in db.users() {
         let user_id = SlackUserId::new(slack_user_id.into());
@@ -276,7 +304,7 @@ async fn update_user_data(
                 }
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {:#?}", e);
             }
         }
     }

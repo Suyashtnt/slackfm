@@ -22,6 +22,27 @@ impl Client {
         }
     }
 
+    pub async fn does_user_exist(&self, user: &str) -> Result<bool, reqwest::Error> {
+        let mut cloned_url = self.base_url.clone();
+        let url = cloned_url
+            .query_pairs_mut()
+            .append_pair("method", "user.getinfo")
+            .append_pair("user", user)
+            .append_pair("api_key", &self.key)
+            .append_pair("format", "json")
+            .finish();
+
+        let response = self
+            .client
+            .get(url.as_ref())
+            .send()
+            .await?
+            .json::<UserInfoResponse>()
+            .await?;
+
+        Ok(response.user.is_some())
+    }
+
     pub async fn get_user_recent_tracks(
         &self,
         user: &str,
@@ -144,6 +165,15 @@ nest! {
                 }>,
             }>,
         },
+    }
+}
+
+nest! {
+    #[derive(serde::Deserialize)]*
+    /// Last.fm API response for the `user.getinfo` method.
+    /// Limited to only the fields we care about.
+    struct UserInfoResponse {
+        user: Option<struct User {}>,
     }
 }
 

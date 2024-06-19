@@ -1,4 +1,5 @@
 use age::secrecy::Secret;
+use futures::Future;
 use oauth2::CsrfToken;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -68,6 +69,20 @@ impl Db {
             location: file_path,
             key,
         }
+    }
+
+    /// Gives you full access to the inner db HashMap, but you have to return an updated version
+    ///
+    /// This is used as a cursed hack to avoid having to clone the entire db when doing bulk updates
+    pub async fn map_db<F>(&mut self, f: impl FnOnce(HashMap<String, Arc<Mutex<UserData>>>) -> F)
+    where
+        F: Future<Output = HashMap<String, Arc<Mutex<UserData>>>>,
+    {
+        let db = std::mem::replace(&mut self.db, HashMap::new());
+        let final_db = f(db).await;
+        self.db = final_db;
+
+        self.to_encrypted_file().unwrap()
     }
 
     /// Create a new Db instance from an encrypted file
