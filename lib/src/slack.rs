@@ -42,15 +42,14 @@ impl Client {
 
     pub async fn update_user_status(
         &self,
-        username: String,
+        user_id: SlackUserId,
         status_text: Option<impl Into<String>>,
         status_emoji: Option<impl Into<SlackEmoji>>,
         status_duration: Option<DateTime<Utc>>,
     ) -> Result<SlackUserProfile, SlackClientError> {
         let session = self.client.open_session(&self.token);
 
-        let user_request =
-            SlackApiUsersProfileGetRequest::new().with_user(SlackUserId::new(username));
+        let user_request = SlackApiUsersProfileGetRequest::new().with_user(user_id);
 
         let user = session.users_profile_get(&user_request).await?;
 

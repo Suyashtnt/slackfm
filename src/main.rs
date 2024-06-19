@@ -362,11 +362,27 @@ async fn update_user_data(
         match track {
             Ok(track) => {
                 if let Some(track) = track {
-                    println!("updating status for {} to {}", user_id, track.name());
-                    println!("TODO: update slack status");
+                    println!("updating status for {} to {}", &user_id, track.name());
+                    if let Err(e) = slack_client
+                        .update_user_status(
+                            user_id.clone(),
+                            Some(format!("{} - {}", track.name(), track.artist())),
+                            Some(":music:"),
+                            // TODO: set expiration
+                            None,
+                        )
+                        .await
+                    {
+                        eprintln!("Error setting status for {}: {}", &user_id, e);
+                    }
                 } else {
                     println!("updating status for {} to not listening/blank", user_id);
-                    println!("TODO: update slack status");
+                    if let Err(e) = slack_client
+                        .update_user_status(user_id.clone(), Some(""), Some(""), None)
+                        .await
+                    {
+                        eprintln!("Error setting status for {}: {}", &user_id, e);
+                    }
                 }
             }
             Err(e) => {
