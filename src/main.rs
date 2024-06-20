@@ -2,30 +2,24 @@ mod db;
 pub mod env;
 mod oauth;
 
-use std::collections::HashMap;
-use std::error::Error;
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, error::Error, fmt, sync::Arc, time::Duration};
 
-use axum::extract::{Query, State};
-use axum::Extension;
+use axum::{
+    extract::{Query, State},
+    Extension,
+};
 use db::{Db, UserData};
 use dotenvy::dotenv;
 use error_stack::{Result, ResultExt};
 use futures::{pin_mut, stream, StreamExt};
 use oauth::{create_oauth_client, OauthCode};
-use oauth2::reqwest::async_http_client;
-use oauth2::{AuthorizationCode, CsrfToken};
+use oauth2::{reqwest::async_http_client, AuthorizationCode, CsrfToken};
 use slack_morphism::prelude::*;
 use slackfm::{lastfm, slack};
-use tokio::sync::oneshot;
-use tokio::task::{AbortHandle, JoinHandle};
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{net::TcpListener, sync::Mutex, task::AbortHandle};
 use tracing::{debug, error, info};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
 
 #[derive(Debug)]
 enum MainError {
