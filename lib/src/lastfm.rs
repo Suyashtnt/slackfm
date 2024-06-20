@@ -191,21 +191,6 @@ nest! {
                     #[serde(rename = "#text")]
                     text: String,
                 },
-                image: Vec<struct Image {
-                    #>[derive(PartialEq, Eq)]
-                    size: enum ImageSize {
-                        #[serde(rename = "small")]
-                        Small,
-                        #[serde(rename = "medium")]
-                        Medium,
-                        #[serde(rename = "large")]
-                        Large,
-                        #[serde(rename = "extralarge")]
-                        ExtraLarge,
-                    },
-                    #[serde(rename = "#text")]
-                    url: Url,
-                }>,
                 album: struct Album {
                     #[serde(rename = "#text")]
                     text: String,
@@ -236,7 +221,6 @@ pub struct RecentTrack {
     name: String,
     artist: String,
     album: String,
-    image_url: Url,
     is_now_playing: bool,
 }
 
@@ -263,10 +247,6 @@ impl RecentTrack {
         &self.album
     }
 
-    pub fn image_url(&self) -> &Url {
-        &self.image_url
-    }
-
     pub fn is_now_playing(&self) -> bool {
         self.is_now_playing
     }
@@ -274,19 +254,11 @@ impl RecentTrack {
 
 impl From<Track> for RecentTrack {
     fn from(track: Track) -> Self {
-        let image_url = track
-            .image
-            .into_iter()
-            .find(|image| image.size == ImageSize::Medium)
-            .map(|image| image.url)
-            .unwrap_or_else(|| Url::parse("https://via.placeholder.com/64").unwrap());
-
         Self {
             name: track.name,
             mbid: track.mbid,
             artist: track.artist.text,
             album: track.album.text,
-            image_url,
             is_now_playing: track.attr.map_or(false, |attr| {
                 attr.now_playing.unwrap_or_else(|| "false".to_string()) == "true"
             }),
