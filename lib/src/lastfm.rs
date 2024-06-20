@@ -1,8 +1,10 @@
-use std::time::Duration;
+use std::{error::Error, fmt, time::Duration};
 
 use async_stream::try_stream;
+use error_stack::{Result, ResultExt};
 use futures::Stream;
 use nestify::nest;
+use tracing::debug;
 use url::Url;
 
 pub const API_BASE: &str = "https://ws.audioscrobbler.com/2.0/";
@@ -13,6 +15,22 @@ pub struct Client {
     base_url: Url,
 }
 
+#[derive(Debug)]
+pub enum LastFMError {
+    RequestError,
+    ParseError,
+}
+
+impl fmt::Display for LastFMError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            LastFMError::RequestError => f.write_str("An error occurred while making the request"),
+            LastFMError::ParseError => f.write_str("An error occurred while parsing the response"),
+        }
+    }
+}
+impl Error for LastFMError {}
+
 impl Client {
     pub fn new(api_key: String, client: reqwest::Client) -> Self {
         Self {
@@ -22,8 +40,10 @@ impl Client {
         }
     }
 
-    pub async fn does_user_exist(&self, user: &str) -> Result<bool, reqwest::Error> {
+    #[tracing::instrument(skip(self))]
+    pub async fn does_user_exist(&self, user: &str) -> Result<bool, LastFMError> {
         let mut cloned_url = self.base_url.clone();
+
         let url = cloned_url
             .query_pairs_mut()
             .append_pair("method", "user.getinfo")
@@ -32,21 +52,30 @@ impl Client {
             .append_pair("format", "json")
             .finish();
 
+        debug!("Requesting user info from LastFM: {}", url.as_ref());
+
         let response = self
             .client
             .get(url.as_ref())
             .send()
-            .await?
+            .await
+            .attach_printable("Couldn't send request")
+            .change_context(LastFMError::RequestError)?
             .json::<UserInfoResponse>()
-            .await?;
+            .await
+            .attach_printable("Couldn't deserialise response")
+            .change_context(LastFMError::ParseError)?;
+
+        debug!("Response form lastFM: {:?}", response);
 
         Ok(response.user.is_some())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn get_user_recent_tracks(
         &self,
         user: &str,
-    ) -> Result<Vec<RecentTrack>, reqwest::Error> {
+    ) -> Result<Vec<RecentTrack>, LastFMError> {
         let mut cloned_url = self.base_url.clone();
         let url = cloned_url
             .query_pairs_mut()
@@ -56,13 +85,21 @@ impl Client {
             .append_pair("format", "json")
             .finish();
 
+        debug!("Requesting recent tracks from LastFM: {}", url.as_ref());
+
         let response = self
             .client
             .get(url.as_ref())
             .send()
-            .await?
+            .await
+            .attach_printable("Couldn't send request")
+            .change_context(LastFMError::RequestError)?
             .json::<RecentTracksResponse>()
-            .await?;
+            .await
+            .attach_printable("Couldn't deserialise response")
+            .change_context(LastFMError::ParseError)?;
+
+        debug!("Response from LastFM: {:?}", response);
 
         Ok(response
             .recenttracks
@@ -76,37 +113,47 @@ impl Client {
     //
     // # Returns
     // returns a new track if a user is playing something new, else returns None if the user has stopped playing anything
+    #[tracing::instrument(skip(self))]
     pub fn stream_now_playing<'a>(
         &'a self,
         user: &'a str,
         polling_interval: Duration,
-    ) -> impl Stream<Item = Result<Option<RecentTrack>, reqwest::Error>> + 'a {
+    ) -> impl Stream<Item = Result<Option<RecentTrack>, LastFMError>> + 'a {
         let mut last_playing: Option<RecentTrack> = None;
         try_stream! {
             loop {
                 // wait before the next poll
                 tokio::time::sleep(polling_interval).await;
 
+                debug!("Polling LastFM for now playing track for {user}");
                 let tracks = self.get_user_recent_tracks(user).await?;
+
                 let now_playing = tracks
                     .into_iter()
                     .find(|track| track.is_now_playing);
 
+                debug!("User {user} is now playing: {:?}", now_playing);
+
                 match (now_playing, last_playing.clone()) {
                     // the user is not playing anything nor has played anything before
-                    (None, None) => continue,
+                    (None, None) => {
+                        debug!("User {user} is not playing anything");
+                    },
                     // The user has started to play their first song
                     (Some(playing), None) => {
+                        debug!("User {user} is now playing their first song: {playing}");
                         last_playing = Some(playing.clone());
                         yield Some(playing);
                     },
                     // The user has stopped playing anything
                     (None, Some(_)) => {
+                        debug!("User {user} has stopped playing anything");
                         last_playing = None;
                         yield None;
                     },
                     // The user is playing a new track
                     (Some(playing), Some(last)) => {
+                        debug!("User {user} is now playing a new track: {playing}. Checking if it's different from the last track: {last}");
                         // make sure the mbid is not empty before checking if they're different
                         if playing.mbid != "" {
                             if playing.mbid != last.mbid {
@@ -127,7 +174,7 @@ impl Client {
 }
 
 nest! {
-    #[derive(serde::Deserialize)]*
+    #[derive(serde::Deserialize, Debug)]*
     /// Last.fm API response for the `user.getrecenttracks` method.
     /// Limited to only the fields we care about.
     struct RecentTracksResponse {
@@ -169,7 +216,7 @@ nest! {
 }
 
 nest! {
-    #[derive(serde::Deserialize)]*
+    #[derive(serde::Deserialize, Debug)]*
     /// Last.fm API response for the `user.getinfo` method.
     /// Limited to only the fields we care about.
     struct UserInfoResponse {
@@ -186,6 +233,12 @@ pub struct RecentTrack {
     album: String,
     image_url: Url,
     is_now_playing: bool,
+}
+
+impl fmt::Display for RecentTrack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} - {}", self.name, self.artist)
+    }
 }
 
 impl RecentTrack {

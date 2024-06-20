@@ -2,6 +2,8 @@ mod db;
 pub mod env;
 mod oauth;
 
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,26 +11,60 @@ use axum::extract::{Query, State};
 use axum::Extension;
 use db::{Db, UserData};
 use dotenvy::dotenv;
+use error_stack::{Result, ResultExt};
 use futures::{pin_mut, stream, StreamExt};
 use oauth::{create_oauth_client, OauthCode};
 use oauth2::reqwest::async_http_client;
 use oauth2::{AuthorizationCode, CsrfToken};
 use slack_morphism::prelude::*;
 use slackfm::{lastfm, slack};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::{net::TcpListener, sync::Mutex};
+use tracing::{error, info};
+use tracing_error::ErrorLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Debug)]
+enum MainError {
+    SetupError,
+    ServerError,
+}
+
+impl fmt::Display for MainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MainError::SetupError => f.write_str("Error setting up the server"),
+            MainError::ServerError => f.write_str("Error running the server"),
+        }
+    }
+}
+
+impl Error for MainError {}
 
 #[tokio::main]
-async fn main() {
-    dotenv().expect(".env file not found");
+async fn main() -> Result<(), MainError> {
+    let subscriber = tracing_subscriber::Registry::default()
+        .with(tracing_subscriber::fmt::layer())
+        .with(ErrorLayer::default())
+        .with(EnvFilter::from_default_env());
+
+    tracing::subscriber::set_global_default(subscriber)
+        .attach_printable("Error setting up the logger")
+        .change_context(MainError::SetupError)?;
+
+    dotenv()
+        .attach_printable("Error loading the .env file")
+        .change_context(MainError::SetupError)?;
 
     if env::any_set() {
         env::assert_env_vars();
-
-        run_server().await.unwrap();
+        run_server()
+            .await
+            .attach_printable("Error running the server")
+            .change_context(MainError::ServerError)
     } else {
         println!("# Environment Variables Help\n{}", env::gen_help());
-        return;
+        Ok(())
     }
 }
 
@@ -165,10 +201,33 @@ struct AppState {
     slack_client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
 }
 
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
+#[derive(Debug)]
+enum ServerError {
+    IoError,
+    LastfmError,
+    DbError,
+}
 
-    let db = Db::from_encrypted_file(cwd.join("db.json.enc"), env::slack_signing_secret())?;
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IoError => f.write_str("An IO error occurred"),
+            Self::LastfmError => f.write_str("A Last.fm error occurred"),
+            Self::DbError => f.write_str("An error occured when setting up the database"),
+        }
+    }
+}
+
+impl Error for ServerError {}
+
+async fn run_server() -> Result<(), ServerError> {
+    let cwd = std::env::current_dir()
+        .attach_printable("Couldn't get current working directory.")
+        .change_context(ServerError::IoError)?;
+
+    let db = Db::from_encrypted_file(cwd.join("db.json.enc"), env::slack_signing_secret())
+        .attach_printable("Couldn't load the database.")
+        .change_context(ServerError::DbError)?;
 
     let app_state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -177,10 +236,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             reqwest::Client::builder()
                 .user_agent("slackfm-bot")
                 .build()
-                .unwrap(),
+                .attach_printable("Couldn't create the Lastfm client HTTP connector.")
+                .change_context(ServerError::IoError)?,
         )),
         slack_client: Arc::new(SlackClient::new(
-            SlackClientHyperConnector::new()?.with_rate_control(SlackApiRateControlConfig::new()),
+            SlackClientHyperConnector::new()
+                .attach_printable("Couldn't create the Slack client HTTP connector.")
+                .change_context(ServerError::IoError)?
+                .with_rate_control(SlackApiRateControlConfig::new()),
         )),
     };
 
@@ -209,16 +272,25 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .route("/auth", axum::routing::get(oauth_handler))
         .with_state(app_state.clone());
 
-    spawn_initial_updaters(app_state.clone()).await;
-
-    axum::serve(TcpListener::bind(&addr).await.unwrap(), app)
+    spawn_initial_updaters(app_state.clone())
         .await
-        .unwrap();
+        .attach_printable("Couldn't spawn the initial updaters.")
+        .change_context(ServerError::LastfmError)?;
+
+    axum::serve(
+        TcpListener::bind(&addr)
+            .await
+            .attach_printable("Couldn't bind listener to the address.")
+            .change_context(ServerError::IoError)?,
+        app,
+    )
+    .await
+    .unwrap();
 
     Ok(())
 }
 
-async fn spawn_initial_updaters(state: AppState) {
+async fn spawn_initial_updaters(state: AppState) -> Result<(), ServerError> {
     let mut db = state.db.lock().await;
 
     db.map_db(|hashmap| {
@@ -235,7 +307,9 @@ async fn spawn_initial_updaters(state: AppState) {
             })
             .collect()
     })
-    .await;
+    .await
+    .attach_printable("Couldn't remove bad users from the database.")
+    .change_context(ServerError::DbError)?;
 
     for (slack_user_id, user_data) in db.users() {
         let user_id = SlackUserId::new(slack_user_id.into());
@@ -247,8 +321,11 @@ async fn spawn_initial_updaters(state: AppState) {
             user_data,
         ));
     }
+
+    Ok(())
 }
 
+#[tracing::instrument(skip(client, lastfm_client, user_data))]
 async fn update_user_data(
     client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
     lastfm_client: Arc<lastfm::Client>,
@@ -263,7 +340,7 @@ async fn update_user_data(
     };
 
     let Some(slack_token) = slack_token else {
-        println!(
+        info!(
             "No slack token for user {}. User didn't authenticate it seems",
             user_id
         );
@@ -291,7 +368,7 @@ async fn update_user_data(
                         )
                         .await
                     {
-                        eprintln!("Error setting status for {}: {}", &user_id, e);
+                        error!("Error setting status for {}: {:#?}", &user_id, e);
                     }
                 } else {
                     println!("updating status for {} to not listening/blank", user_id);
@@ -299,12 +376,12 @@ async fn update_user_data(
                         .update_user_status(user_id.clone(), Some(""), Some(""), None)
                         .await
                     {
-                        eprintln!("Error setting status for {}: {}", &user_id, e);
+                        error!("Error setting status for {}: {:#?}", &user_id, e);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Error: {:#?}", e);
+                error!("Error: {:#?}", e);
             }
         }
     }
