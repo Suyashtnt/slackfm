@@ -2,6 +2,7 @@ mod db;
 pub mod env;
 mod oauth;
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -18,8 +19,10 @@ use oauth2::reqwest::async_http_client;
 use oauth2::{AuthorizationCode, CsrfToken};
 use slack_morphism::prelude::*;
 use slackfm::{lastfm, slack};
+use tokio::sync::oneshot;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::{net::TcpListener, sync::Mutex};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
@@ -84,85 +87,124 @@ async fn command_event(
     State(state): State<AppState>,
 ) -> axum::Json<SlackCommandEventResponse> {
     match &*event.command.0 {
-        "/connect" => {
-            println!("Received connect command");
-
-            let Some(lastfm_username) = event.text.and_then(|text| {
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(
-                        text.split_once(" ")
-                            .map(|split| split.0.to_owned())
-                            .unwrap_or_else(|| text.to_owned()),
-                    )
-                }
-            }) else {
-                return axum::Json(SlackCommandEventResponse::new(
-                    SlackMessageContent::new()
-                        .with_text("No username found. Please give one".into()),
-                ));
-            };
-
-            // check if the lastfm user exists
-            if !state
-                .lastfm_client
-                .does_user_exist(&lastfm_username)
-                .await
-                .unwrap_or(false)
-            {
-                return axum::Json(SlackCommandEventResponse::new(
-                    SlackMessageContent::new().with_text("The lastfm username isn't valid/doesn't exist. Make sure you're inputting your username from the URL (https://www.last.fm/user/<username>)".into()),
-                ));
-            }
-
-            let mut db = state.db.lock().await;
-
-            let user = db.user(&event.user_id.0);
-
-            if let Some(user) = user.filter(|user| user.lock().unwrap().slack_token().is_some()) {
-                user.lock().unwrap().update_lastfm_username(lastfm_username);
-                db.to_encrypted_file().unwrap();
-
-                axum::Json(SlackCommandEventResponse::new(
-                    SlackMessageContent::new().with_text("Updated Last.fm username".into()),
-                ))
-            } else {
-                let oauth_client = create_oauth_client();
-
-                // note: we aren't doing PKCE since this is only ran on a trusted server
-
-                let (auth_url, csrf_token) = oauth_client
-                    .authorize_url(CsrfToken::new_random)
-                    .add_extra_param("scope", "commands")
-                    .add_extra_param("user_scope", "users.profile:read,users.profile:write")
-                    .url();
-
-                if let Err(e) =
-                    db.add_user(event.user_id.0, UserData::new(lastfm_username, csrf_token))
-                {
-                    return axum::Json(SlackCommandEventResponse::new(
-                        SlackMessageContent::new()
-                            .with_text(format!("Error adding your user to the database: {}", e)),
-                    ));
-                }
-
-                // send an oauth link
-                axum::Json(
-                    SlackCommandEventResponse::new(SlackMessageContent::new().with_text(format!(
-                        "Please visit {} to allow SlackFM to access and modify your profile/status",
-                        auth_url
-                    )))
-                    .with_response_type(SlackMessageResponseType::Ephemeral),
-                )
-            }
-        }
+        "/connect" => connect_handler(event, state).await,
+        "/disconnect" => disconnect_handler(event, state).await,
         _ => {
-            println!("Received unknown command");
+            info!("Received unknown command");
             axum::Json(SlackCommandEventResponse::new(
                 SlackMessageContent::new().with_text("Received unknown command".into()),
             ))
         }
+    }
+}
+
+async fn disconnect_handler(
+    event: SlackCommandEvent,
+    state: AppState,
+) -> axum::Json<SlackCommandEventResponse> {
+    info!("Received disconnect command");
+
+    let mut db = state.db.lock().await;
+    let user_id = event.user_id;
+
+    match db.remove_user(&user_id.0) {
+        Ok(Some(_)) => {
+            let abort_handle = state.tasks.lock().await.remove(&user_id.into()).unwrap();
+            abort_handle.abort();
+
+            axum::Json(SlackCommandEventResponse::new(
+                SlackMessageContent::new().with_text("Disconnected lastfm user".into()),
+            ))
+        }
+        Ok(None) => axum::Json(SlackCommandEventResponse::new(
+            SlackMessageContent::new()
+                .with_text("You were not found in the database!. Please run /connect".into()),
+        )),
+        Err(e) => {
+            error!("Error removing user {}: {}", user_id, e);
+            axum::Json(SlackCommandEventResponse::new(
+                SlackMessageContent::new()
+                    .with_text(
+                        "Error disconnecting your user. A report has been logged on the server"
+                            .into(),
+                    )
+                    .into(),
+            ))
+        }
+    }
+}
+
+async fn connect_handler(
+    event: SlackCommandEvent,
+    state: AppState,
+) -> axum::Json<SlackCommandEventResponse> {
+    println!("Received connect command");
+
+    let Some(lastfm_username) = event.text.and_then(|text| {
+        if text.is_empty() {
+            None
+        } else {
+            Some(
+                text.split_once(" ")
+                    .map(|split| split.0.to_owned())
+                    .unwrap_or_else(|| text.to_owned()),
+            )
+        }
+    }) else {
+        return axum::Json(SlackCommandEventResponse::new(
+            SlackMessageContent::new().with_text("No username found. Please give one".into()),
+        ));
+    };
+
+    // check if the lastfm user exists
+    if !state
+        .lastfm_client
+        .does_user_exist(&lastfm_username)
+        .await
+        .unwrap_or(false)
+    {
+        return axum::Json(SlackCommandEventResponse::new(
+            SlackMessageContent::new().with_text("The lastfm username isn't valid/doesn't exist. Make sure you're inputting your username from the URL (https://www.last.fm/user/<username>)".into()),
+        ));
+    }
+
+    let mut db = state.db.lock().await;
+
+    let user = db.user(&event.user_id.0);
+
+    if let Some(user) = user.filter(|user| user.lock().unwrap().slack_token().is_some()) {
+        user.lock().unwrap().update_lastfm_username(lastfm_username);
+        db.to_encrypted_file().unwrap();
+
+        axum::Json(SlackCommandEventResponse::new(
+            SlackMessageContent::new().with_text("Updated Last.fm username".into()),
+        ))
+    } else {
+        let oauth_client = create_oauth_client();
+
+        // note: we aren't doing PKCE since this is only ran on a trusted server
+
+        let (auth_url, csrf_token) = oauth_client
+            .authorize_url(CsrfToken::new_random)
+            .add_extra_param("scope", "commands")
+            .add_extra_param("user_scope", "users.profile:read,users.profile:write")
+            .url();
+
+        if let Err(e) = db.add_user(event.user_id.0, UserData::new(lastfm_username, csrf_token)) {
+            return axum::Json(SlackCommandEventResponse::new(
+                SlackMessageContent::new()
+                    .with_text(format!("Error adding your user to the database: {}", e)),
+            ));
+        }
+
+        // send an oauth link
+        axum::Json(
+            SlackCommandEventResponse::new(SlackMessageContent::new().with_text(format!(
+                "Please visit {} to allow SlackFM to access and modify your profile/status",
+                auth_url
+            )))
+            .with_response_type(SlackMessageResponseType::Ephemeral),
+        )
     }
 }
 
@@ -191,12 +233,17 @@ async fn oauth_handler(
     user_arc.lock().unwrap().promote_token(user_token);
 
     db.to_encrypted_file().unwrap();
-    tokio::task::spawn(update_user_data(
+
+    let user_id: SlackUserId = user_id.into();
+    let abort_handle = tokio::task::spawn(update_user_data(
         state.slack_client.clone(),
         state.lastfm_client.clone(),
-        user_id.into(),
+        user_id.clone(),
         user_arc,
-    ));
+    ))
+    .abort_handle();
+
+    state.tasks.lock().await.insert(user_id, abort_handle);
 
     "Authenticated!"
 }
@@ -204,6 +251,7 @@ async fn oauth_handler(
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Db>>,
+    tasks: Arc<Mutex<HashMap<SlackUserId, AbortHandle>>>,
     lastfm_client: Arc<lastfm::Client>,
     slack_client: Arc<SlackClient<SlackClientHyperConnector<SlackHyperHttpsConnector>>>,
 }
@@ -238,6 +286,7 @@ async fn run_server() -> Result<(), ServerError> {
 
     let app_state = AppState {
         db: Arc::new(Mutex::new(db)),
+        tasks: Arc::new(Mutex::new(HashMap::new())),
         lastfm_client: Arc::new(lastfm::Client::new(
             env::lastfm_key(),
             reqwest::Client::builder()
@@ -321,12 +370,15 @@ async fn spawn_initial_updaters(state: AppState) -> Result<(), ServerError> {
     for (slack_user_id, user_data) in db.users() {
         let user_id = SlackUserId::new(slack_user_id.into());
         let lastfm_client = state.lastfm_client.clone();
-        tokio::task::spawn(update_user_data(
+        let abort_handle = tokio::task::spawn(update_user_data(
             state.slack_client.clone(),
             lastfm_client,
-            user_id,
+            user_id.clone(),
             user_data,
-        ));
+        ))
+        .abort_handle();
+
+        state.tasks.lock().await.insert(user_id, abort_handle);
     }
 
     Ok(())
@@ -360,7 +412,10 @@ async fn update_user_data(
 
     pin_mut!(stream);
 
+    info!("Polling user data for user {}", user_id);
+
     while let Some(track) = stream.next().await {
+        debug!("Got track: {:?}", track);
         match track {
             Ok(track) => {
                 if let Some(track) = track {

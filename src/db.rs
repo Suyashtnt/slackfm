@@ -193,6 +193,12 @@ impl Db {
         self.to_encrypted_file()
     }
 
+    pub fn remove_user(&mut self, username: &str) -> Result<Option<Arc<Mutex<UserData>>>, DbError> {
+        let user = self.db.remove(username);
+        self.to_encrypted_file()?;
+        Ok(user)
+    }
+
     pub fn user_with_csrf(&self, state: &String) -> Option<Arc<Mutex<UserData>>> {
         self.db
             .iter()
