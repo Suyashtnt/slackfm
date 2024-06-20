@@ -1,13 +1,11 @@
 use std::{
     error::Error,
     fmt::{self, Debug},
-    io,
     sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
 use error_stack::{Result, ResultExt};
-use errors::SlackClientError;
 use slack_morphism::prelude::*;
 use tracing::debug;
 
