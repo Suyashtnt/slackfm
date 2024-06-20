@@ -138,7 +138,14 @@ async fn command_event(
                     .add_extra_param("user_scope", "users.profile:read,users.profile:write")
                     .url();
 
-                db.add_user(event.user_id.0, UserData::new(lastfm_username, csrf_token));
+                if let Err(e) =
+                    db.add_user(event.user_id.0, UserData::new(lastfm_username, csrf_token))
+                {
+                    return axum::Json(SlackCommandEventResponse::new(
+                        SlackMessageContent::new()
+                            .with_text(format!("Error adding your user to the database: {}", e)),
+                    ));
+                }
 
                 // send an oauth link
                 axum::Json(
