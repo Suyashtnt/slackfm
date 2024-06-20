@@ -4,6 +4,7 @@ use async_stream::try_stream;
 use error_stack::{Result, ResultExt};
 use futures::Stream;
 use nestify::nest;
+use serde_json::{from_value, Value};
 use tracing::debug;
 use url::Url;
 
@@ -94,14 +95,18 @@ impl Client {
             .await
             .attach_printable("Couldn't send request")
             .change_context(LastFMError::RequestError)?
-            .json::<RecentTracksResponse>()
+            .json::<Value>()
             .await
             .attach_printable("Couldn't deserialise response")
             .change_context(LastFMError::ParseError)?;
 
         debug!("Response from LastFM: {:?}", response);
 
-        Ok(response
+        let parsed_response: RecentTracksResponse = from_value(response)
+            .attach_printable("Couldn't parse response")
+            .change_context(LastFMError::ParseError)?;
+
+        Ok(parsed_response
             .recenttracks
             .track
             .into_iter()
